@@ -23,6 +23,12 @@ INSIGNIAS = [("🌱", "Primera semilla", "Envía tu primer reporte", 1, "rep"),
              ("🏅", "50 puntos", "Acumula 50 puntos", 50, "pts"),
              ("🌎", "EcoHéroe", "Acumula 350 puntos", 350, "pts")]
 
+QUIZ = [("¿De qué color es la caneca para residuos orgánicos en Colombia?", ["Verde", "Blanca", "Negra"], 0),
+        ("¿Cuánto tarda en degradarse una botella plástica?", ["Un mes", "Cientos de años", "Cinco días"], 1),
+        ("¿Qué gas es el principal responsable del calentamiento global?", ["Oxígeno", "Dióxido de carbono", "Nitrógeno"], 1),
+        ("¿Cuál es la mejor forma de reducir residuos?", ["Reducir y reutilizar", "Comprar más descartables"], 0),
+        ("¿Qué se hace con las pilas usadas?", ["Botarlas a la basura común", "Quemarlas", "Llevarlas a un punto de recolección"], 2)]
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ecocosta-dev")
 app.config["MAX_FORM_MEMORY_SIZE"] = 8 * 1024 * 1024
@@ -111,9 +117,14 @@ def salir():
 @app.route("/")
 def inicio():
     pts = (q("SELECT puntos FROM usuarios WHERE id=?", (session["uid"],), one=True) or [0])[0]
+    uid = session["uid"]
+    hoy = lambda t: bool(q("SELECT 1 FROM actividad WHERE usuario_id=? AND tipo=? AND date(fecha)=date('now','localtime')", (uid, t), one=True))
+    misiones = [("📝", "Envía un reporte", hoy("reporte")), ("👍", "Apoya el reporte de alguien", hoy("apoyo")), ("🧠", "Resuelve el quiz del día", hoy("quiz"))]
+    comu = (q("SELECT COUNT(*) FROM reportes", one=True)[0], q("SELECT COUNT(*) FROM reportes WHERE estado='Resuelto'", one=True)[0],
+            q("SELECT COUNT(*) FROM usuarios", one=True)[0])
     sig = next((l for l in (50, 150, 350, 700) if pts < l), None)
     pend = q("SELECT COUNT(*) FROM reportes WHERE estado='Pendiente'", one=True)[0]
-    return render_template("inicio.html", pts=pts, nivel=nivel(pts), consejo=random.choice(CONSEJOS), sig=sig, pend=pend)
+    return render_template("inicio.html", pts=pts, nivel=nivel(pts), consejo=random.choice(CONSEJOS), sig=sig, pend=pend, misiones=misiones, comu=comu)
 
 @app.route("/reportar", methods=["GET", "POST"])
 def reportar():
@@ -149,7 +160,7 @@ def logros():
     nrep = q("SELECT COUNT(*) FROM reportes WHERE usuario_id=?", (uid,), one=True)[0]
     pts = (q("SELECT puntos FROM usuarios WHERE id=?", (uid,), one=True) or [0])[0]
     ins = [(i, n, d, u, (nrep if t == "rep" else pts) >= u) for i, n, d, u, t in INSIGNIAS]
-    rank = q("SELECT u.username,u.puntos,COUNT(r.id) FROM usuarios u LEFT JOIN reportes r "
+    rank = q("SELECT u.username,u.puntos,COUNT(r.id),u.foto_perfil FROM usuarios u LEFT JOIN reportes r "
              "ON r.usuario_id=u.id GROUP BY u.id ORDER BY u.puntos DESC, COUNT(r.id) DESC LIMIT 10")
     return render_template("logros.html", ins=ins, rank=rank)
 
@@ -228,6 +239,23 @@ def demo():
     flash("✔ Datos de ejemplo cargados (usuarios de prueba con clave 1234)")
     return redirect("/")
 
+@app.route("/quiz", methods=["GET", "POST"])
+def quiz():
+    if staff(): return redirect("/")
+    uid = session["uid"]
+    hecho = q("SELECT 1 FROM actividad WHERE usuario_id=? AND tipo='quiz' AND date(fecha)=date('now','localtime')", (uid,), one=True)
+    if request.method == "POST" and not hecho:
+        ok = sum(1 for i, (_, _, c) in enumerate(QUIZ) if request.form.get(f"q{i}") == str(c))
+        q("UPDATE usuarios SET puntos=puntos+? WHERE id=?", (ok * 5, uid), commit=True)
+        log(uid, "quiz", f"Resolvió el quiz ambiental: {ok}/{len(QUIZ)} (+{ok * 5} pts)")
+        flash(f"🧠 Acertaste {ok} de {len(QUIZ)} · +{ok * 5} puntos")
+        return redirect("/")
+    return render_template("quiz.html", quiz=QUIZ, hecho=hecho)
+
+@app.route("/guia")
+def guia():
+    return render_template("guia.html")
+
 @app.route("/mapa")
 def mapa():
     pts = [dict(lugar=l, cat=c, estado=e, lat=la, lon=lo) for l, c, e, la, lo in
@@ -245,7 +273,7 @@ def exportar():
     return Response("\ufeff" + o.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=reportes_ecocosta.csv"})
 
-ICONOS = {"login": "🔑", "reporte": "📝", "perfil": "👤", "respuesta": "💬", "estado": "🔄", "apoyo": "👍"}
+ICONOS = {"login": "🔑", "reporte": "📝", "perfil": "👤", "respuesta": "💬", "estado": "🔄", "apoyo": "👍", "quiz": "🧠"}
 
 @app.route("/stats")
 def stats():
@@ -374,9 +402,16 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')</scri
 "login.html": """{% extends 'base.html' %}{% block c %}<h1>🌿 EcoCosta</h1><p class="muted">Reportes ambientales · Fundación y Aracataca</p>
 <form method="post" class="card"><input name="u" placeholder="Usuario" required><input name="p" type="password" placeholder="Contraseña" required>
 <button>Iniciar sesión</button><button class="sec" formaction="/registro">Crear cuenta</button></form>{% endblock %}""",
-"inicio.html": """{% extends 'base.html' %}{% block c %}<h1>Hola, {{session.user}} 👋</h1>{% if nuevas %}<a href="/mis-reportes" style="text-decoration:none;color:inherit"><div class="msg">🔔 Tienes {{nuevas}} respuesta(s) nueva(s) a tus reportes</div></a>{% endif %}
+"inicio.html": """{% extends 'base.html' %}{% block c %}<div style="background:linear-gradient(135deg,#166534,#22C55E);border-radius:18px;padding:18px;color:#fff;margin-bottom:10px"><div style="font-size:14px;opacity:.9">Bienvenido a</div><div style="font-size:26px;font-weight:800">🌿 EcoCosta</div><div>Hola, {{session.user}} 👋 · cuidemos Fundación y Aracataca</div></div>{% if nuevas %}<a href="/mis-reportes" style="text-decoration:none;color:inherit"><div class="msg">🔔 Tienes {{nuevas}} respuesta(s) nueva(s) a tus reportes</div></a>{% endif %}
 {% if session.rol=='user' %}<div class="card"><div style="font-size:28px;color:var(--gold)">🏅 {{pts}} pts</div><div class="muted">Nivel: {{nivel}}</div>{% if sig %}<div style="background:var(--c2);border-radius:6px;margin:8px 0 4px"><div style="width:{{(pts*100/sig)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div><div class="muted">{{sig-pts}} pts para el siguiente nivel</div>{% endif %}</div>
 <a href="/reportar"><button>📝 Nuevo reporte (+10 pts)</button></a>{% else %}<div class="card">📥 <b>{{pend}}</b> reportes pendientes de atender</div><form method="post" action="/demo"><button class="sec">🧪 Cargar datos de ejemplo</button></form><a href="/panel"><button>🛠️ Ir al panel de reportes</button></a>{% endif %}
+{% if session.rol=='user' %}<h2>🎯 Misiones de hoy</h2><div class="card">{% for m in misiones %}<div style="padding:6px 0">{{'✅' if m[2] else '⬜'}} {{m[0]}} {{m[1]}}</div>{% endfor %}
+<a href="/quiz"><button class="sec">🧠 Quiz ambiental (+5 pts por acierto)</button></a></div>{% endif %}
+<h2>🌍 Impacto de la comunidad</h2><div style="display:flex;gap:8px">
+<div class="card" style="flex:1;text-align:center"><div style="font-size:24px;color:var(--ac)">{{comu[0]}}</div><div class="muted">Reportes</div></div>
+<div class="card" style="flex:1;text-align:center"><div style="font-size:24px;color:var(--ac)">{{comu[1]}}</div><div class="muted">Resueltos</div></div>
+<div class="card" style="flex:1;text-align:center"><div style="font-size:24px;color:var(--ac)">{{comu[2]}}</div><div class="muted">Ciudadanos</div></div></div>
+<a href="/guia"><button class="sec">♻️ Guía de reciclaje</button></a>
 <h2>Consejo del día <a href="/consejos" style="font-size:13px;color:var(--ac)">ver todos</a></h2><div class="card"><b>{{consejo[0]}} {{consejo[1]}}</b><p class="muted">{{consejo[2]}}</p></div>{% endblock %}""",
 "reportar.html": """{% extends 'base.html' %}{% block c %}<h1>📝 Nuevo reporte</h1><form method="post" class="card">
 <select name="mun">{% for m in muns %}<option>{{m}}</option>{% endfor %}</select>
@@ -395,7 +430,9 @@ function(){gpsmsg.textContent='No se pudo obtener la ubicación (revisa el permi
 {% if r[4]=='Pendiente' %}<form method="post" action="/eliminar/{{r[7]}}" onsubmit="return confirm('¿Eliminar este reporte?')"><button class="sec">🗑️ Eliminar</button></form>{% endif %}{% if r[5] %}<div class="msg"><b>Respuesta:</b> {{r[5]}}</div>{% endif %}</div>{% else %}<p class="muted">Aún no has enviado reportes.</p>{% endfor %}{% endblock %}""",
 "logros.html": """{% extends 'base.html' %}{% block c %}{% if session.rol=='user' %}<h1>🏆 Insignias</h1>{% for i in ins %}
 <div class="card {{'' if i[4] else 'off'}}"><b>{{i[0]}} {{i[1]}}</b><div class="muted">{{i[2]}}</div></div>{% endfor %}{% endif %}
-<h2>Ranking</h2>{% for r in rank %}<div class="card">{{loop.index}}. <b>{{r[0]}}</b> · 🏅 {{r[1]}} pts · {{r[2]}} reportes</div>{% endfor %}{% endblock %}""",
+<h2>Ranking</h2>{% for r in rank %}<div class="card" style="display:flex;gap:12px;align-items:center;{{'border-color:var(--gold);' if loop.index<=3}}"><span style="font-size:26px;width:34px;text-align:center">{{['🥇','🥈','🥉'][loop.index0] if loop.index<=3 else loop.index}}</span>
+{% if r[3] %}<img src="{{r[3]}}" style="width:42px;height:42px;border-radius:50%;object-fit:cover">{% else %}<span style="font-size:32px">🌿</span>{% endif %}
+<div><b>{{r[0]}}</b><div class="muted">🏅 {{r[1]}} pts · {{r[2]}} reportes</div></div></div>{% endfor %}{% endblock %}""",
 "perfil.html": """{% extends 'base.html' %}{% block c %}<h1>👤 Mi perfil</h1><form method="post" class="card" style="text-align:center">
 <img id="prev" src="{{foto or ''}}" style="{{'' if foto else 'display:none;'}}width:120px;height:120px;border-radius:50%;object-fit:cover;border:3px solid var(--ac)">
 {% if not foto %}<div style="font-size:64px">🌿</div>{% endif %}<h2>{{session.user}}</h2><div class="muted">{{nivel}} · 🏅 {{pts}} pts · {{nrep}} reportes</div>
@@ -428,6 +465,15 @@ if(g.length)m.fitBounds(g,{padding:[30,30],maxZoom:16});</script>{% endblock %}"
 {% elif r[9] %}<span class="muted">✔ Ya lo apoyaste</span>{% endif %}</div></div>{% else %}<p class="muted">No se encontraron reportes.</p>{% endfor %}{% endblock %}""",
 "consejos.html": """{% extends 'base.html' %}{% block c %}<h1>🌱 Consejos ambientales</h1>{% for c in cs %}<div class="card"><b>{{c[0]}} {{c[1]}}</b><p class="muted">{{c[2]}}</p></div>{% endfor %}{% endblock %}""",
 "usuarios.html": """{% extends 'base.html' %}{% block c %}<h1>🧑‍🤝‍🧑 Usuarios</h1>{% for r in rows %}<div class="card"><b>{{r[0]}}</b> · {{r[3]}}<div class="muted">🏅 {{r[1]}} pts · {{r[2]}} reportes</div></div>{% else %}<p class="muted">Aún no hay usuarios.</p>{% endfor %}{% endblock %}""",
+"quiz.html": """{% extends 'base.html' %}{% block c %}<h1>🧠 Quiz ambiental</h1>{% if hecho %}<div class="msg">Ya resolviste el quiz de hoy. ¡Vuelve mañana por más puntos!</div>{% else %}
+<form method="post">{% for p in quiz %}{% set i = loop.index0 %}<div class="card"><b>{{loop.index}}. {{p[0]}}</b>
+{% for o in p[1] %}<label style="display:block;padding:8px 0"><input type="radio" name="q{{i}}" value="{{loop.index0}}" style="width:auto;margin-right:8px" required>{{o}}</label>{% endfor %}</div>{% endfor %}
+<button>Enviar respuestas</button></form>{% endif %}{% endblock %}""",
+"guia.html": """{% extends 'base.html' %}{% block c %}<h1>♻️ Guía de reciclaje</h1>
+<div class="card" style="border-left:6px solid #E5E7EB"><b>⚪ Caneca blanca · Aprovechables</b><p class="muted">Plástico, vidrio, metales, papel y cartón limpios y secos.</p></div>
+<div class="card" style="border-left:6px solid #22C55E"><b>🟢 Caneca verde · Orgánicos</b><p class="muted">Restos de comida, cáscaras y residuos de jardín.</p></div>
+<div class="card" style="border-left:6px solid #6B7280"><b>⚫ Caneca negra · No aprovechables</b><p class="muted">Papel higiénico, servilletas usadas, empaques sucios y colillas.</p></div>
+<div class="card" style="border-left:6px solid var(--warn)"><b>⚠️ Residuos peligrosos</b><p class="muted">Pilas, bombillas y medicamentos vencidos van a puntos de recolección especiales, nunca a la basura común.</p></div>{% endblock %}""",
 "panel.html": """{% extends 'base.html' %}{% block c %}<h1>🛠️ Panel de reportes</h1><form method="get" class="card"><select name="estado" onchange="this.form.submit()"><option value="">Todos los estados</option>{% for e in estados %}<option {{'selected' if e==est}}>{{e}}</option>{% endfor %}</select>
 <select name="cat" onchange="this.form.submit()"><option value="">Todas las categorías</option>{% for c in cats %}<option {{'selected' if c==cat}}>{{c}}</option>{% endfor %}</select>
 <a href="/exportar.csv"><button type="button" class="sec">⬇️ Exportar a CSV</button></a></form>{% for r in rows %}<div class="card">
