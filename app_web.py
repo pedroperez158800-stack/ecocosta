@@ -25,6 +25,8 @@ INSIGNIAS = [("🌱", "Primera semilla", "Envía tu primer reporte", 1, "rep"),
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ecocosta-dev")
+app.config["MAX_FORM_MEMORY_SIZE"] = 8 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 def q(sql, args=(), one=False, commit=False):
     con = sqlite3.connect(DB)
@@ -48,11 +50,19 @@ def init_db():
         reporte_id INTEGER NOT NULL UNIQUE, respuesta TEXT NOT NULL, visto INTEGER DEFAULT 0,
         fecha TEXT DEFAULT (datetime('now','localtime')));""")
     con.commit(); con.close()
+    for sql in ["ALTER TABLE usuarios ADD COLUMN foto_perfil TEXT", "ALTER TABLE usuarios ADD COLUMN bio TEXT",
+        "CREATE TABLE IF NOT EXISTS actividad (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER NOT NULL, tipo TEXT NOT NULL, descripcion TEXT NOT NULL, fecha TEXT DEFAULT (datetime('now','localtime')))"]:
+        try: q(sql, commit=True)
+        except Exception: pass
 
 def nivel(p):
     for lim, n in [(50, "🌱 Semilla"), (150, "🌿 Brote"), (350, "🌳 Árbol"), (700, "🌲 Guardián")]:
         if p < lim: return n
     return "🌎 EcoHéroe"
+
+def log(uid, tipo, desc):
+    if uid and uid > 0:
+        q("INSERT INTO actividad (usuario_id,tipo,descripcion) VALUES (?,?,?)", (uid, tipo, desc), commit=True)
 
 def pw(p): return hashlib.sha256(p.encode()).hexdigest()
 def logged(): return "uid" in session
@@ -76,6 +86,7 @@ def login():
             if not r:
                 flash("Usuario o contraseña incorrectos"); return redirect("/login")
             session.update(uid=r[0], user=u, rol="user")
+            log(r[0], "login", "Inició sesión")
         return redirect("/")
     return render_template("login.html")
 
@@ -110,17 +121,19 @@ def reportar():
             flash("Completa dirección y descripción"); return redirect("/reportar")
         lat = float(f["lat"]) if f.get("lat") else None
         lon = float(f["lon"]) if f.get("lon") else None
-        q("INSERT INTO reportes (usuario_id,lugar,descripcion,categoria,lat,lon) VALUES (?,?,?,?,?,?)",
-          (session["uid"], f"{f['mun']} - {f['direccion'].strip()}", f["desc"].strip(), f["cat"], lat, lon),
+        foto = f["foto"] if f.get("foto", "").startswith("data:image/") else None
+        q("INSERT INTO reportes (usuario_id,lugar,descripcion,categoria,foto_path,lat,lon) VALUES (?,?,?,?,?,?,?)",
+          (session["uid"], f"{f['mun']} - {f['direccion'].strip()}", f["desc"].strip(), f["cat"], foto, lat, lon),
           commit=True)
         q("UPDATE usuarios SET puntos=puntos+10 WHERE id=?", (session["uid"],), commit=True)
+        log(session["uid"], "reporte", f"Envió un reporte: {f['cat']} (+10 pts)")
         flash("✔ Reporte enviado · +10 puntos")
         return redirect("/mis-reportes")
     return render_template("reportar.html", cats=CATS, muns=MUNICIPIOS)
 
 @app.route("/mis-reportes")
 def mis_reportes():
-    rows = q("SELECT r.lugar,r.descripcion,r.categoria,r.fecha,r.estado,ra.respuesta FROM reportes r "
+    rows = q("SELECT r.lugar,r.descripcion,r.categoria,r.fecha,r.estado,ra.respuesta,r.foto_path FROM reportes r "
              "LEFT JOIN respuestas_admin ra ON ra.reporte_id=r.id WHERE r.usuario_id=? "
              "ORDER BY r.fecha DESC LIMIT 20", (session["uid"],))
     q("UPDATE respuestas_admin SET visto=1 WHERE reporte_id IN "
@@ -137,10 +150,53 @@ def logros():
              "ON r.usuario_id=u.id GROUP BY u.id ORDER BY u.puntos DESC, COUNT(r.id) DESC LIMIT 10")
     return render_template("logros.html", ins=ins, rank=rank)
 
+ICONOS = {"login": "🔑", "reporte": "📝", "perfil": "👤", "respuesta": "💬", "estado": "🔄"}
+
+@app.route("/stats")
+def stats():
+    w, a = ("", ()) if staff() else ("WHERE usuario_id=?", (session["uid"],))
+    tot = q(f"SELECT COUNT(*) FROM reportes {w}", a, one=True)[0]
+    est = dict(q(f"SELECT estado,COUNT(*) FROM reportes {w} GROUP BY estado", a))
+    cat = q(f"SELECT categoria,COUNT(*) c FROM reportes {w} GROUP BY categoria ORDER BY c DESC", a)
+    dia = q(f"SELECT date(fecha),COUNT(*) FROM reportes {w} GROUP BY date(fecha) ORDER BY date(fecha) DESC LIMIT 7", a)[::-1]
+    return render_template("stats.html", tot=tot, est=est, estados=ESTADOS, cat=cat, dia=dia,
+                           mc=max([n for _, n in cat] or [1]), md=max([n for _, n in dia] or [1]))
+
+@app.route("/actividad")
+def actividad():
+    if staff():
+        rows = q("SELECT a.tipo,a.descripcion,a.fecha,u.username FROM actividad a "
+                 "LEFT JOIN usuarios u ON u.id=a.usuario_id ORDER BY a.id DESC LIMIT 30")
+    else:
+        rows = q("SELECT tipo,descripcion,fecha,NULL FROM actividad WHERE usuario_id=? ORDER BY id DESC LIMIT 20",
+                 (session["uid"],))
+    return render_template("actividad.html", rows=[(ICONOS.get(t, "•"), d, f, u) for t, d, f, u in rows])
+
+@app.context_processor
+def avisos():
+    n = 0
+    if session.get("rol") == "user":
+        n = q("SELECT COUNT(*) FROM respuestas_admin ra JOIN reportes r ON ra.reporte_id=r.id "
+              "WHERE r.usuario_id=? AND ra.visto=0", (session["uid"],), one=True)[0]
+    return {"nuevas": n}
+
+@app.route("/perfil", methods=["GET", "POST"])
+def perfil():
+    if staff(): return redirect("/")
+    uid = session["uid"]
+    if request.method == "POST":
+        if request.form.get("foto", "").startswith("data:image/"):
+            q("UPDATE usuarios SET foto_perfil=? WHERE id=?", (request.form["foto"], uid), commit=True)
+        q("UPDATE usuarios SET bio=? WHERE id=?", (request.form.get("bio", "").strip()[:300], uid), commit=True)
+        log(uid, "perfil", "Actualizó su perfil"); flash("Perfil actualizado"); return redirect("/perfil")
+    foto, bio, pts = q("SELECT foto_perfil,bio,puntos FROM usuarios WHERE id=?", (uid,), one=True)
+    nrep = q("SELECT COUNT(*) FROM reportes WHERE usuario_id=?", (uid,), one=True)[0]
+    return render_template("perfil.html", foto=foto, bio=bio or "", pts=pts, nivel=nivel(pts), nrep=nrep)
+
 @app.route("/panel")
 def panel():
     if not staff(): return redirect("/")
-    rows = q("SELECT r.id,r.lugar,r.descripcion,r.categoria,r.fecha,r.estado,u.username,ra.respuesta "
+    rows = q("SELECT r.id,r.lugar,r.descripcion,r.categoria,r.fecha,r.estado,u.username,ra.respuesta,r.foto_path "
              "FROM reportes r JOIN usuarios u ON r.usuario_id=u.id "
              "LEFT JOIN respuestas_admin ra ON ra.reporte_id=r.id ORDER BY r.fecha DESC LIMIT 100")
     return render_template("panel.html", rows=rows, estados=ESTADOS)
@@ -152,6 +208,9 @@ def panel_update(rid):
     if request.form.get("resp", "").strip():
         q("INSERT INTO respuestas_admin (reporte_id,respuesta,visto) VALUES (?,?,0) ON CONFLICT(reporte_id) "
           "DO UPDATE SET respuesta=excluded.respuesta, visto=0", (rid, request.form["resp"].strip()), commit=True)
+    dueno = (q("SELECT usuario_id FROM reportes WHERE id=?", (rid,), one=True) or [0])[0]
+    log(dueno, "estado", f"Tu reporte #{rid} ahora está: {request.form['estado']}")
+    if request.form.get("resp", "").strip(): log(dueno, "respuesta", f"Respondieron tu reporte #{rid}")
     flash("Reporte actualizado")
     return redirect("/panel")
 
@@ -196,19 +255,23 @@ input,select,textarea,button{width:100%;padding:12px;margin:6px 0;border-radius:
 button{background:var(--ac);color:#08210f;font-weight:700;border:0}button.sec{background:#1E2D19;color:var(--t1)}
 .muted{color:var(--t2);font-size:14px}.tag{font-size:12px;padding:2px 8px;border-radius:99px;background:#1E2D19;color:var(--warn)}
 .msg{background:#1E2D19;border-left:4px solid var(--ac);padding:10px;border-radius:8px;margin:8px 0}
-nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:#111A0F;border-top:1px solid var(--bd)}
-nav a{flex:1;text-align:center;padding:12px 4px;color:var(--t2);text-decoration:none;font-size:13px}nav a b{display:block;font-size:20px}
+nav{position:fixed;bottom:0;left:0;right:0;display:flex;overflow-x:auto;background:#111A0F;border-top:1px solid var(--bd)}
+nav a{flex:1 0 auto;min-width:68px;text-align:center;padding:12px 4px;color:var(--t2);text-decoration:none;font-size:13px}nav a b{display:block;font-size:20px}
 .off{opacity:.35}</style></head><body>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="msg">{{x}}</div>{% endfor %}{% endwith %}
 {% block c %}{% endblock %}
 {% if session.uid is defined %}<nav><a href="/"><b>🏠</b>Inicio</a>
-{% if session.rol=='user' %}<a href="/reportar"><b>📝</b>Reportar</a><a href="/mis-reportes"><b>📋</b>Mis reportes</a><a href="/logros"><b>🏆</b>Logros</a>
-{% else %}<a href="/panel"><b>🛠️</b>Panel</a><a href="/logros"><b>🏆</b>Ranking</a>{% endif %}
-<a href="/salir"><b>🚪</b>Salir</a></nav>{% endif %}<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')</script></body></html>""",
+{% if session.rol=='user' %}<a href="/reportar"><b>📝</b>Reportar</a><a href="/mis-reportes"><b>📋{% if nuevas %}<span style="background:#EF4444;border-radius:99px;font-size:11px;padding:1px 6px;vertical-align:top">{{nuevas}}</span>{% endif %}</b>Mis reportes</a><a href="/logros"><b>🏆</b>Logros</a><a href="/perfil"><b>👤</b>Perfil</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a>
+{% else %}<a href="/panel"><b>🛠️</b>Panel</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a><a href="/logros"><b>🏆</b>Ranking</a>{% endif %}
+<a href="/salir"><b>🚪</b>Salir</a></nav>{% endif %}<script>function foto(i,t,p){var f=i.files[0];if(!f)return;var r=new FileReader();r.onload=function(e){var im=new Image();
+im.onload=function(){var s=Math.min(1,800/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=im.width*s;c.height=im.height*s;
+c.getContext('2d').drawImage(im,0,0,c.width,c.height);var d=c.toDataURL('image/jpeg',.7);document.getElementById(t).value=d;
+var v=document.getElementById(p);v.src=d;v.style.display='block'};im.src=e.target.result};r.readAsDataURL(f)}
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')</script></body></html>""",
 "login.html": """{% extends 'base.html' %}{% block c %}<h1>🌿 EcoCosta</h1><p class="muted">Reportes ambientales · Fundación y Aracataca</p>
 <form method="post" class="card"><input name="u" placeholder="Usuario" required><input name="p" type="password" placeholder="Contraseña" required>
 <button>Iniciar sesión</button><button class="sec" formaction="/registro">Crear cuenta</button></form>{% endblock %}""",
-"inicio.html": """{% extends 'base.html' %}{% block c %}<h1>Hola, {{session.user}} 👋</h1>
+"inicio.html": """{% extends 'base.html' %}{% block c %}<h1>Hola, {{session.user}} 👋</h1>{% if nuevas %}<a href="/mis-reportes" style="text-decoration:none;color:inherit"><div class="msg">🔔 Tienes {{nuevas}} respuesta(s) nueva(s) a tus reportes</div></a>{% endif %}
 {% if session.rol=='user' %}<div class="card"><div style="font-size:28px;color:var(--gold)">🏅 {{pts}} pts</div><div class="muted">Nivel: {{nivel}}</div></div>
 <a href="/reportar"><button>📝 Nuevo reporte (+10 pts)</button></a>{% else %}<a href="/panel"><button>🛠️ Ir al panel de reportes</button></a>{% endif %}
 <h2>Consejo del día</h2><div class="card"><b>{{consejo[0]}} {{consejo[1]}}</b><p class="muted">{{consejo[2]}}</p></div>{% endblock %}""",
@@ -219,18 +282,31 @@ nav a{flex:1;text-align:center;padding:12px 4px;color:var(--t2);text-decoration:
 <textarea name="desc" rows="4" placeholder="Describe el problema" required></textarea>
 <input type="hidden" name="lat" id="lat"><input type="hidden" name="lon" id="lon">
 <button type="button" class="sec" onclick="gps()">📍 Usar mi ubicación</button><div class="muted" id="gpsmsg">Sin ubicación GPS (opcional)</div>
-<button>Enviar reporte</button></form>
+<div class="muted">📷 Foto (opcional)</div><input type="file" accept="image/*" onchange="foto(this,'foto','prev')">
+<input type="hidden" name="foto" id="foto"><img id="prev" style="display:none;width:100%;border-radius:10px"><button>Enviar reporte</button></form>
 <script>function gps(){navigator.geolocation.getCurrentPosition(function(p){lat.value=p.coords.latitude;lon.value=p.coords.longitude;
 gpsmsg.textContent='✔ Ubicación guardada: '+p.coords.latitude.toFixed(5)+', '+p.coords.longitude.toFixed(5)},
 function(){gpsmsg.textContent='No se pudo obtener la ubicación (revisa el permiso)'})}</script>{% endblock %}""",
 "mis.html": """{% extends 'base.html' %}{% block c %}<h1>📋 Mis reportes</h1>{% for r in rows %}<div class="card">
-<span class="tag">{{r[4]}}</span> <span class="tag">{{r[2]}}</span><p><b>{{r[0]}}</b></p><p class="muted">{{r[1]}}</p><div class="muted">{{r[3]}}</div>
+<span class="tag">{{r[4]}}</span> <span class="tag">{{r[2]}}</span><p><b>{{r[0]}}</b></p><p class="muted">{{r[1]}}</p><div class="muted">{{r[3]}}</div>{% if r[6] %}<img src="{{r[6]}}" style="width:100%;border-radius:10px;margin-top:8px">{% endif %}
 {% if r[5] %}<div class="msg"><b>Respuesta:</b> {{r[5]}}</div>{% endif %}</div>{% else %}<p class="muted">Aún no has enviado reportes.</p>{% endfor %}{% endblock %}""",
 "logros.html": """{% extends 'base.html' %}{% block c %}{% if session.rol=='user' %}<h1>🏆 Insignias</h1>{% for i in ins %}
 <div class="card {{'' if i[4] else 'off'}}"><b>{{i[0]}} {{i[1]}}</b><div class="muted">{{i[2]}}</div></div>{% endfor %}{% endif %}
 <h2>Ranking</h2>{% for r in rank %}<div class="card">{{loop.index}}. <b>{{r[0]}}</b> · 🏅 {{r[1]}} pts · {{r[2]}} reportes</div>{% endfor %}{% endblock %}""",
+"perfil.html": """{% extends 'base.html' %}{% block c %}<h1>👤 Mi perfil</h1><form method="post" class="card" style="text-align:center">
+<img id="prev" src="{{foto or ''}}" style="{{'' if foto else 'display:none;'}}width:120px;height:120px;border-radius:50%;object-fit:cover;border:3px solid var(--ac)">
+{% if not foto %}<div style="font-size:64px">🌿</div>{% endif %}<h2>{{session.user}}</h2><div class="muted">{{nivel}} · 🏅 {{pts}} pts · {{nrep}} reportes</div>
+<input type="file" accept="image/*" onchange="foto(this,'foto','prev')"><input type="hidden" name="foto" id="foto">
+<textarea name="bio" rows="3" maxlength="300" placeholder="Cuéntanos algo sobre ti">{{bio}}</textarea><button>Guardar perfil</button></form>{% endblock %}""",
+"stats.html": """{% extends 'base.html' %}{% block c %}<h1>📊 Estadísticas</h1>
+<div style="display:flex;gap:8px;flex-wrap:wrap"><div class="card" style="flex:1;min-width:70px;text-align:center"><div style="font-size:26px;color:var(--ac)">{{tot}}</div><div class="muted">Total</div></div>
+{% for e in estados %}<div class="card" style="flex:1;min-width:70px;text-align:center"><div style="font-size:26px">{{est.get(e,0)}}</div><div class="muted">{{e}}</div></div>{% endfor %}</div>
+<h2>Por categoría</h2><div class="card">{% for c,n in cat %}<div class="muted">{{c}} · {{n}}</div><div style="background:#1E2D19;border-radius:6px;margin:3px 0 10px"><div style="width:{{(n*100/mc)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div>{% else %}<span class="muted">Sin datos</span>{% endfor %}</div>
+<h2>Últimos días</h2><div class="card">{% for c,n in dia %}<div class="muted">{{c}} · {{n}}</div><div style="background:#1E2D19;border-radius:6px;margin:3px 0 10px"><div style="width:{{(n*100/md)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div>{% else %}<span class="muted">Sin datos</span>{% endfor %}</div>{% endblock %}""",
+"actividad.html": """{% extends 'base.html' %}{% block c %}<h1>🕒 Actividad</h1>{% for r in rows %}<div class="card">{{r[0]}} {% if r[3] %}<b>{{r[3]}}</b>: {% endif %}{{r[1]}}
+<div class="muted">{{r[2]}}</div></div>{% else %}<p class="muted">Todavía no hay actividad.</p>{% endfor %}{% endblock %}""",
 "panel.html": """{% extends 'base.html' %}{% block c %}<h1>🛠️ Panel de reportes</h1>{% for r in rows %}<div class="card">
-<span class="tag">{{r[3]}}</span> <b>#{{r[0]}}</b> · {{r[6]}}<p><b>{{r[1]}}</b></p><p class="muted">{{r[2]}}</p>
+<span class="tag">{{r[3]}}</span> <b>#{{r[0]}}</b> · {{r[6]}}<p><b>{{r[1]}}</b></p><p class="muted">{{r[2]}}</p>{% if r[8] %}<img src="{{r[8]}}" style="width:100%;border-radius:10px">{% endif %}
 <form method="post" action="/panel/{{r[0]}}"><select name="estado">{% for e in estados %}<option {{'selected' if e==r[5]}}>{{e}}</option>{% endfor %}</select>
 <textarea name="resp" rows="2" placeholder="Respuesta al usuario">{{r[7] or ''}}</textarea><button>Guardar</button></form></div>
 {% else %}<p class="muted">No hay reportes.</p>{% endfor %}{% endblock %}""",
