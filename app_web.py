@@ -57,6 +57,8 @@ def init_db():
         fecha TEXT DEFAULT (datetime('now','localtime')));""")
     con.commit(); con.close()
     for sql in ["ALTER TABLE usuarios ADD COLUMN foto_perfil TEXT", "ALTER TABLE usuarios ADD COLUMN bio TEXT",
+        "CREATE TABLE IF NOT EXISTS jornadas (id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT, lugar TEXT, fecha TEXT, descripcion TEXT)",
+        "CREATE TABLE IF NOT EXISTS inscripciones (jornada_id INTEGER, usuario_id INTEGER, PRIMARY KEY (jornada_id, usuario_id))",
         "CREATE TABLE IF NOT EXISTS apoyos (reporte_id INTEGER, usuario_id INTEGER, PRIMARY KEY (reporte_id, usuario_id))",
         "CREATE TABLE IF NOT EXISTS actividad (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER NOT NULL, tipo TEXT NOT NULL, descripcion TEXT NOT NULL, fecha TEXT DEFAULT (datetime('now','localtime')))"]:
         try: q(sql, commit=True)
@@ -66,6 +68,13 @@ def nivel(p):
     for lim, n in [(50, "🌱 Semilla"), (150, "🌿 Brote"), (350, "🌳 Árbol"), (700, "🌲 Guardián")]:
         if p < lim: return n
     return "🌎 EcoHéroe"
+
+def ganar(uid, pts):
+    pts_de = lambda: (q("SELECT puntos FROM usuarios WHERE id=?", (uid,), one=True) or [0])[0]
+    antes = nivel(pts_de())
+    q("UPDATE usuarios SET puntos=puntos+? WHERE id=?", (pts, uid), commit=True)
+    despues = nivel(pts_de())
+    return f" · ¡Subiste a {despues}!" if despues != antes else ""
 
 def log(uid, tipo, desc):
     if uid and uid > 0:
@@ -139,9 +148,9 @@ def reportar():
         q("INSERT INTO reportes (usuario_id,lugar,descripcion,categoria,foto_path,lat,lon) VALUES (?,?,?,?,?,?,?)",
           (session["uid"], f"{f['mun']} - {f['direccion'].strip()}", f["desc"].strip(), f["cat"], foto, lat, lon),
           commit=True)
-        q("UPDATE usuarios SET puntos=puntos+10 WHERE id=?", (session["uid"],), commit=True)
+        extra = ganar(session["uid"], 10)
         log(session["uid"], "reporte", f"Envió un reporte: {f['cat']} (+10 pts)")
-        flash("✔ Reporte enviado · +10 puntos")
+        flash("🎉 Reporte enviado · +10 puntos" + extra)
         return redirect("/mis-reportes")
     return render_template("reportar.html", cats=CATS, muns=MUNICIPIOS)
 
@@ -233,6 +242,9 @@ def demo():
         q("INSERT INTO reportes (usuario_id,lugar,descripcion,categoria,lat,lon,estado) VALUES (?,?,?,?,?,?,?)",
           (ids[i], lugar, desc, cat, la, lo, est), commit=True)
         q("UPDATE usuarios SET puntos=puntos+10 WHERE id=?", (ids[i],), commit=True)
+    for t, l, f, d in [("Limpieza del río Fundación", "Puente principal, Fundación", "2026-10-10", "Jornada comunitaria de recolección de residuos en la ribera. Lleva guantes y bolsas."),
+                       ("Siembra de árboles", "Parque principal, Aracataca", "2026-10-17", "Sembraremos árboles nativos junto a las familias del barrio.")]:
+        q("INSERT INTO jornadas (titulo,lugar,fecha,descripcion) VALUES (?,?,?,?)", (t, l, f, d), commit=True)
     for (rid,) in q("SELECT id FROM reportes WHERE estado='Resuelto'"):
         q("INSERT OR IGNORE INTO respuestas_admin (reporte_id,respuesta) VALUES (?,?)",
           (rid, "Atendido por la cuadrilla de Interaseo. ¡Gracias por reportar!"), commit=True)
@@ -246,15 +258,37 @@ def quiz():
     hecho = q("SELECT 1 FROM actividad WHERE usuario_id=? AND tipo='quiz' AND date(fecha)=date('now','localtime')", (uid,), one=True)
     if request.method == "POST" and not hecho:
         ok = sum(1 for i, (_, _, c) in enumerate(QUIZ) if request.form.get(f"q{i}") == str(c))
-        q("UPDATE usuarios SET puntos=puntos+? WHERE id=?", (ok * 5, uid), commit=True)
+        extra = ganar(uid, ok * 5)
         log(uid, "quiz", f"Resolvió el quiz ambiental: {ok}/{len(QUIZ)} (+{ok * 5} pts)")
-        flash(f"🧠 Acertaste {ok} de {len(QUIZ)} · +{ok * 5} puntos")
+        flash(f"🎉 Acertaste {ok} de {len(QUIZ)} · +{ok * 5} puntos" + extra)
         return redirect("/")
     return render_template("quiz.html", quiz=QUIZ, hecho=hecho)
 
 @app.route("/guia")
 def guia():
     return render_template("guia.html")
+
+@app.route("/jornadas", methods=["GET", "POST"])
+def jornadas():
+    if request.method == "POST" and staff():
+        f = request.form
+        q("INSERT INTO jornadas (titulo,lugar,fecha,descripcion) VALUES (?,?,?,?)", (f["titulo"], f["lugar"], f["fecha"], f["desc"]), commit=True)
+        flash("Jornada creada"); return redirect("/jornadas")
+    rows = q("SELECT j.id,j.titulo,j.lugar,j.fecha,j.descripcion,(SELECT COUNT(*) FROM inscripciones i WHERE i.jornada_id=j.id),"
+             "(SELECT COUNT(*) FROM inscripciones i WHERE i.jornada_id=j.id AND i.usuario_id=?) FROM jornadas j ORDER BY j.fecha", (session["uid"],))
+    return render_template("jornadas.html", rows=rows)
+
+@app.route("/jornadas/<int:jid>/unirme", methods=["POST"])
+def unirme(jid):
+    if staff(): return redirect("/jornadas")
+    try:
+        q("INSERT INTO inscripciones VALUES (?,?)", (jid, session["uid"]), commit=True)
+        extra = ganar(session["uid"], 15)
+        log(session["uid"], "jornada", f"Se inscribió a la jornada #{jid} (+15 pts)")
+        flash("🎉 ¡Inscrito! +15 puntos" + extra)
+    except sqlite3.IntegrityError:
+        flash("Ya estabas inscrito")
+    return redirect("/jornadas")
 
 @app.route("/mapa")
 def mapa():
@@ -273,7 +307,7 @@ def exportar():
     return Response("\ufeff" + o.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=reportes_ecocosta.csv"})
 
-ICONOS = {"login": "🔑", "reporte": "📝", "perfil": "👤", "respuesta": "💬", "estado": "🔄", "apoyo": "👍", "quiz": "🧠"}
+ICONOS = {"login": "🔑", "reporte": "📝", "perfil": "👤", "respuesta": "💬", "estado": "🔄", "apoyo": "👍", "quiz": "🧠", "jornada": "🧹"}
 
 @app.route("/stats")
 def stats():
@@ -282,7 +316,11 @@ def stats():
     est = dict(q(f"SELECT estado,COUNT(*) FROM reportes {w} GROUP BY estado", a))
     cat = q(f"SELECT categoria,COUNT(*) c FROM reportes {w} GROUP BY categoria ORDER BY c DESC", a)
     dia = q(f"SELECT date(fecha),COUNT(*) FROM reportes {w} GROUP BY date(fecha) ORDER BY date(fecha) DESC LIMIT 7", a)[::-1]
-    return render_template("stats.html", tot=tot, est=est, estados=ESTADOS, cat=cat, dia=dia,
+    cols, off, segs = {"Pendiente": "#EF4444", "En proceso": "#F59E0B", "Resuelto": "#22C55E"}, 0, []
+    for e in ESTADOS:
+        L = 251.33 * est.get(e, 0) / tot if tot else 0
+        segs.append((cols[e], round(L, 2), round(-off, 2))); off += L
+    return render_template("stats.html", segs=segs, tot=tot, est=est, estados=ESTADOS, cat=cat, dia=dia,
                            tasa=int(est.get("Resuelto", 0) * 100 / tot) if tot else 0, mc=max([n for _, n in cat] or [1]), md=max([n for _, n in dia] or [1]))
 
 @app.route("/actividad")
@@ -391,13 +429,17 @@ nav a{flex:1 0 auto;min-width:68px;text-align:center;padding:12px 4px;color:var(
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="msg">{{x}}</div>{% endfor %}{% endwith %}
 {% block c %}{% endblock %}
 {% if session.uid is defined %}<nav><a href="/"><b>🏠</b>Inicio</a>
-{% if session.rol=='user' %}<a href="/reportar"><b>📝</b>Reportar</a><a href="/comunidad"><b>👥</b>Comunidad</a><a href="/mis-reportes"><b>📋{% if nuevas %}<span style="background:#EF4444;border-radius:99px;font-size:11px;padding:1px 6px;vertical-align:top">{{nuevas}}</span>{% endif %}</b>Mis reportes</a><a href="/logros"><b>🏆</b>Logros</a><a href="/perfil"><b>👤</b>Perfil</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a><a href="/mapa"><b>🗺️</b>Mapa</a>
-{% else %}<a href="/panel"><b>🛠️</b>Panel</a><a href="/comunidad"><b>👥</b>Comunidad</a><a href="/usuarios"><b>🧑‍🤝‍🧑</b>Usuarios</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a><a href="/mapa"><b>🗺️</b>Mapa</a><a href="/logros"><b>🏆</b>Ranking</a>{% endif %}
+{% if session.rol=='user' %}<a href="/reportar"><b>📝</b>Reportar</a><a href="/comunidad"><b>👥</b>Comunidad</a><a href="/mis-reportes"><b>📋{% if nuevas %}<span style="background:#EF4444;border-radius:99px;font-size:11px;padding:1px 6px;vertical-align:top">{{nuevas}}</span>{% endif %}</b>Mis reportes</a><a href="/logros"><b>🏆</b>Logros</a><a href="/perfil"><b>👤</b>Perfil</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a><a href="/mapa"><b>🗺️</b>Mapa</a><a href="/jornadas"><b>🧹</b>Jornadas</a>
+{% else %}<a href="/panel"><b>🛠️</b>Panel</a><a href="/comunidad"><b>👥</b>Comunidad</a><a href="/usuarios"><b>🧑‍🤝‍🧑</b>Usuarios</a><a href="/stats"><b>📊</b>Stats</a><a href="/actividad"><b>🕒</b>Actividad</a><a href="/mapa"><b>🗺️</b>Mapa</a><a href="/jornadas"><b>🧹</b>Jornadas</a><a href="/logros"><b>🏆</b>Ranking</a>{% endif %}
 <a href="/salir"><b>🚪</b>Salir</a></nav>{% endif %}<script>function tema(){var d=document.documentElement,n=d.dataset.theme=='light'?'dark':'light';d.dataset.theme=n;try{localStorage.setItem('t',n)}catch(e){}}
 function foto(i,t,p){var f=i.files[0];if(!f)return;var r=new FileReader();r.onload=function(e){var im=new Image();
 im.onload=function(){var s=Math.min(1,800/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=im.width*s;c.height=im.height*s;
 c.getContext('2d').drawImage(im,0,0,c.width,c.height);var d=c.toDataURL('image/jpeg',.7);document.getElementById(t).value=d;
 var v=document.getElementById(p);v.src=d;v.style.display='block'};im.src=e.target.result};r.readAsDataURL(f)}
+function confeti(){var c=document.createElement('canvas');c.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:99';c.width=innerWidth;c.height=innerHeight;document.body.appendChild(c);
+var x=c.getContext('2d'),P=[],t=0;for(var i=0;i<120;i++)P.push({x:Math.random()*c.width,y:-20-Math.random()*c.height/2,v:2+Math.random()*4,s:5+Math.random()*6,h:Math.random()*360});
+(function f(){x.clearRect(0,0,c.width,c.height);P.forEach(function(p){p.y+=p.v;p.x+=Math.sin(p.y/20);x.fillStyle='hsl('+p.h+',90%,60%)';x.fillRect(p.x,p.y,p.s,p.s)});if(++t<160)requestAnimationFrame(f);else c.remove()})()}
+document.querySelectorAll('.msg').forEach(function(m){if(m.textContent.indexOf('🎉')>-1)confeti()});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')</script></body></html>""",
 "login.html": """{% extends 'base.html' %}{% block c %}<h1>🌿 EcoCosta</h1><p class="muted">Reportes ambientales · Fundación y Aracataca</p>
 <form method="post" class="card"><input name="u" placeholder="Usuario" required><input name="p" type="password" placeholder="Contraseña" required>
@@ -419,12 +461,15 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')</scri
 <select name="cat">{% for c in cats %}<option>{{c}}</option>{% endfor %}</select>
 <textarea name="desc" rows="4" placeholder="Describe el problema" required></textarea>
 <input type="hidden" name="lat" id="lat"><input type="hidden" name="lon" id="lon">
-<button type="button" class="sec" onclick="gps()">📍 Usar mi ubicación</button><div class="muted" id="gpsmsg">Sin ubicación GPS (opcional)</div>
+<div class="muted">🗺️ Toca el mapa para marcar el lugar exacto</div><div id="mp" style="height:220px;border-radius:10px;margin:6px 0"></div><button type="button" class="sec" onclick="gps()">📍 Usar mi ubicación</button><div class="muted" id="gpsmsg">Sin ubicación GPS (opcional)</div>
 <div class="muted">📷 Foto (opcional)</div><input type="file" accept="image/*" onchange="foto(this,'foto','prev')">
 <input type="hidden" name="foto" id="foto"><img id="prev" style="display:none;width:100%;border-radius:10px"><button>Enviar reporte</button></form>
-<script>function gps(){navigator.geolocation.getCurrentPosition(function(p){lat.value=p.coords.latitude;lon.value=p.coords.longitude;
-gpsmsg.textContent='✔ Ubicación guardada: '+p.coords.latitude.toFixed(5)+', '+p.coords.longitude.toFixed(5)},
-function(){gpsmsg.textContent='No se pudo obtener la ubicación (revisa el permiso)'})}</script>{% endblock %}""",
+<script>function gps(){navigator.geolocation.getCurrentPosition(function(p){pon(p.coords.latitude,p.coords.longitude,1)},
+function(){gpsmsg.textContent='No se pudo obtener la ubicación (revisa el permiso)'})}</script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>var mk,mapa=L.map('mp').setView([10.52,-74.19],12);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(mapa);
+function pon(a,b,z){if(mk)mk.setLatLng([a,b]);else mk=L.marker([a,b]).addTo(mapa);if(z)mapa.setView([a,b],16);lat.value=a;lon.value=b;gpsmsg.textContent='✔ Ubicación marcada: '+a.toFixed(5)+', '+b.toFixed(5)}
+mapa.on('click',function(e){pon(e.latlng.lat,e.latlng.lng)});</script>{% endblock %}""",
 "mis.html": """{% extends 'base.html' %}{% block c %}<h1>📋 Mis reportes</h1>{% for r in rows %}<div class="card">
 <span class="tag">{{r[4]}}</span> <span class="tag">{{r[2]}}</span><p><b>{{r[0]}}</b></p><p class="muted">{{r[1]}}</p><div class="muted">{{r[3]}}</div>{% if r[6] %}<img src="{{r[6]}}" style="width:100%;border-radius:10px;margin-top:8px">{% endif %}
 {% if r[4]=='Pendiente' %}<form method="post" action="/eliminar/{{r[7]}}" onsubmit="return confirm('¿Eliminar este reporte?')"><button class="sec">🗑️ Eliminar</button></form>{% endif %}{% if r[5] %}<div class="msg"><b>Respuesta:</b> {{r[5]}}</div>{% endif %}</div>{% else %}<p class="muted">Aún no has enviado reportes.</p>{% endfor %}{% endblock %}""",
@@ -441,7 +486,8 @@ function(){gpsmsg.textContent='No se pudo obtener la ubicación (revisa el permi
 "stats.html": """{% extends 'base.html' %}{% block c %}<h1>📊 Estadísticas</h1>
 <div style="display:flex;gap:8px;flex-wrap:wrap"><div class="card" style="flex:1;min-width:70px;text-align:center"><div style="font-size:26px;color:var(--ac)">{{tot}}</div><div class="muted">Total</div></div>
 {% for e in estados %}<div class="card" style="flex:1;min-width:70px;text-align:center"><div style="font-size:26px">{{est.get(e,0)}}</div><div class="muted">{{e}}</div></div>{% endfor %}</div>
-<div class="card">✅ Tasa de resolución: <b>{{tasa}}%</b></div><h2>Por categoría</h2><div class="card">{% for c,n in cat %}<div class="muted">{{c}} · {{n}}</div><div style="background:var(--c2);border-radius:6px;margin:3px 0 10px"><div style="width:{{(n*100/mc)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div>{% else %}<span class="muted">Sin datos</span>{% endfor %}</div>
+<div class="card"><svg viewBox="0 0 100 100" width="170" style="display:block;margin:auto;transform:rotate(-90deg)"><circle r="40" cx="50" cy="50" fill="none" stroke="var(--c2)" stroke-width="16"/>{% for c,L,o in segs %}<circle r="40" cx="50" cy="50" fill="none" stroke="{{c}}" stroke-width="16" stroke-dasharray="{{L}} 251.33" stroke-dashoffset="{{o}}"/>{% endfor %}</svg>
+<div class="muted" style="text-align:center">🔴 Pendiente · 🟠 En proceso · 🟢 Resuelto</div></div><div class="card">✅ Tasa de resolución: <b>{{tasa}}%</b></div><h2>Por categoría</h2><div class="card">{% for c,n in cat %}<div class="muted">{{c}} · {{n}}</div><div style="background:var(--c2);border-radius:6px;margin:3px 0 10px"><div style="width:{{(n*100/mc)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div>{% else %}<span class="muted">Sin datos</span>{% endfor %}</div>
 <h2>Últimos días</h2><div class="card">{% for c,n in dia %}<div class="muted">{{c}} · {{n}}</div><div style="background:var(--c2);border-radius:6px;margin:3px 0 10px"><div style="width:{{(n*100/md)|int}}%;background:var(--ac);height:10px;border-radius:6px"></div></div>{% else %}<span class="muted">Sin datos</span>{% endfor %}</div>{% endblock %}""",
 "actividad.html": """{% extends 'base.html' %}{% block c %}<h1>🕒 Actividad</h1>{% for r in rows %}<div class="card">{{r[0]}} {% if r[3] %}<b>{{r[3]}}</b>: {% endif %}{{r[1]}}
 <div class="muted">{{r[2]}}</div></div>{% else %}<p class="muted">Todavía no hay actividad.</p>{% endfor %}{% endblock %}""",
@@ -459,7 +505,7 @@ if(g.length)m.fitBounds(g,{padding:[30,30],maxZoom:16});</script>{% endblock %}"
 "comunidad.html": """{% extends 'base.html' %}{% block c %}<h1>👥 Comunidad</h1>
 <form method="get" class="card"><input name="q" value="{{qs}}" placeholder="🔍 Buscar por lugar, categoría o texto"><button>Buscar</button></form>
 {% for r in rows %}<div class="card"><span class="tag">{{r[4]}}</span> <span class="tag">{{r[3]}}</span><p><b>{{r[1]}}</b></p><p class="muted">{{r[2]}}</p>
-{% if r[6] %}<img src="{{r[6]}}" style="width:100%;border-radius:10px">{% endif %}<div class="muted">por {{r[7]}} · {{r[5]}}</div>
+{% if r[6] %}<img src="{{r[6]}}" style="width:100%;border-radius:10px">{% endif %}<div class="muted">por {{r[7]}} · {{r[5]}}</div><a href="https://wa.me/?text={{('🌿 Reporte en EcoCosta: '~r[3]~' en '~r[1])|urlencode}}" target="_blank" style="color:var(--ac);font-size:14px">📲 Compartir por WhatsApp</a>
 <div style="display:flex;gap:8px;align-items:center"><b>👍 {{r[8]}}</b>
 {% if session.rol=='user' and r[10]!=uid and not r[9] %}<form method="post" action="/apoyar/{{r[0]}}" style="flex:1"><button class="sec">👍 Yo también lo vi</button></form>
 {% elif r[9] %}<span class="muted">✔ Ya lo apoyaste</span>{% endif %}</div></div>{% else %}<p class="muted">No se encontraron reportes.</p>{% endfor %}{% endblock %}""",
@@ -474,6 +520,12 @@ if(g.length)m.fitBounds(g,{padding:[30,30],maxZoom:16});</script>{% endblock %}"
 <div class="card" style="border-left:6px solid #22C55E"><b>🟢 Caneca verde · Orgánicos</b><p class="muted">Restos de comida, cáscaras y residuos de jardín.</p></div>
 <div class="card" style="border-left:6px solid #6B7280"><b>⚫ Caneca negra · No aprovechables</b><p class="muted">Papel higiénico, servilletas usadas, empaques sucios y colillas.</p></div>
 <div class="card" style="border-left:6px solid var(--warn)"><b>⚠️ Residuos peligrosos</b><p class="muted">Pilas, bombillas y medicamentos vencidos van a puntos de recolección especiales, nunca a la basura común.</p></div>{% endblock %}""",
+"jornadas.html": """{% extends 'base.html' %}{% block c %}<h1>🧹 Jornadas de limpieza</h1>
+{% if session.rol!='user' %}<form method="post" class="card"><b>Crear jornada</b><input name="titulo" placeholder="Título" required><input name="lugar" placeholder="Lugar" required>
+<input name="fecha" type="date" required><textarea name="desc" rows="2" placeholder="Descripción"></textarea><button>Publicar jornada</button></form>{% endif %}
+{% for r in rows %}<div class="card"><b>🌿 {{r[1]}}</b><p class="muted">📍 {{r[2]}} · 📅 {{r[3]}}</p><p>{{r[4]}}</p><div class="muted">👥 {{r[5]}} inscritos</div>
+{% if session.rol=='user' %}{% if r[6] %}<div class="msg">✔ Ya estás inscrito</div>{% else %}<form method="post" action="/jornadas/{{r[0]}}/unirme"><button>🙋 Quiero participar (+15 pts)</button></form>{% endif %}{% endif %}</div>
+{% else %}<p class="muted">Aún no hay jornadas programadas.</p>{% endfor %}{% endblock %}""",
 "panel.html": """{% extends 'base.html' %}{% block c %}<h1>🛠️ Panel de reportes</h1><form method="get" class="card"><select name="estado" onchange="this.form.submit()"><option value="">Todos los estados</option>{% for e in estados %}<option {{'selected' if e==est}}>{{e}}</option>{% endfor %}</select>
 <select name="cat" onchange="this.form.submit()"><option value="">Todas las categorías</option>{% for c in cats %}<option {{'selected' if c==cat}}>{{c}}</option>{% endfor %}</select>
 <a href="/exportar.csv"><button type="button" class="sec">⬇️ Exportar a CSV</button></a></form>{% for r in rows %}<div class="card">
